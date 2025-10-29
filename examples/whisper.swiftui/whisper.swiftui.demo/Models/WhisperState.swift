@@ -21,6 +21,19 @@ class WhisperState: NSObject, ObservableObject, AVAudioRecorderDelegate {
     private var isTranscribingChunk = false
     private var currentTranscriptionTask: Task<Void, Never>?
     
+    // Merge Strategy Constants
+    private var rollingBuffer: [Float] = []           // 10-20s audio samples
+    private var superBuffer: [Float] = []             // Accumulated stable audio
+    private var superBufferText: String = ""          // Stable transcription
+    private var rollingBufferText: String = ""        // Current rolling transcription
+
+    // Timing constants
+    private let rollingMin: Int = 160_000   // 10s at 16kHz
+    private let rollingMax: Int = 320_000   // 20s at 16kHz
+    private let stableLength: Int = 240_000 // 15s at 16kHz
+    private let cutLength: Int = 160_000    // 10s Mark at 16kHz
+    private let overlapLength: Int = 80_000 // 5s at 16kHz
+    
     private var builtInModelUrl: URL? {
         Bundle.main.url(forResource: "ggml-base.en", withExtension: "bin", subdirectory: "models")
     }
@@ -186,10 +199,11 @@ class WhisperState: NSObject, ObservableObject, AVAudioRecorderDelegate {
                             try await self.audioCapture?.startCapture()
                             self.isRealTimeTranscribing = true
                             self.chunks = []
-                            self.messageLog += "Transcription started...\n"
+                            self.messageLog = "Transcription started...\n"
+                            self.superBufferText = ""
                             
                         } catch {
-                            self.messageLog += "Error starting transcription: \(error.localizedDescription)\n"
+                            self.messageLog = "Error starting transcription: \(error.localizedDescription)\n"
                         }
                     }
                 }
@@ -212,8 +226,8 @@ class WhisperState: NSObject, ObservableObject, AVAudioRecorderDelegate {
             
             // Merge all chunks using your convergence strategy
 //            let finalText = mergeChunks(chunks)
-            let finalText = chunks.joined(separator: " ")
-            messageLog += "\n=== Final Transcription ===\n\(finalText)\n"
+//            let finalText = chunks.joined(separator: " ")
+//            messageLog += "\n=== Final Transcription ===\n\(finalText)\n"
             
             self.audioCapture = nil
         }
@@ -223,7 +237,7 @@ class WhisperState: NSObject, ObservableObject, AVAudioRecorderDelegate {
                 print("Already transcribing, skipping chunk")
                 return
             }
-            
+                        
             guard let whisperContext = whisperContext else { return }
             
             isTranscribingChunk = true
@@ -235,14 +249,159 @@ class WhisperState: NSObject, ObservableObject, AVAudioRecorderDelegate {
                 
                 chunks.append(text)
                 
-                // Show progressive results
-                messageLog += "[\(chunks.count)]: \(text)\n"
+                // Phase 1: Before super buffer exists (buffer < 20s)
+                if samples.count < rollingMax {
+                    // UI shows: superBufferText + rollingBufferText only via merge
+                    messageLog = "Transcription: \(mergeWithOverlap(oldText: superBufferText, newText: text, overlapSeconds: 10))\n"
+                }
                 
+                // Phase 2: Cutting (buffer hits 20s)
+                else {
+                    // We trim buffer to keep calculations short and show superBufferText + rollingBufferText (merged)
+                    superBufferText = mergeWithOverlap(oldText: superBufferText, newText: text, overlapSeconds: 10)
+                    await self.audioCapture?.cutAudioBuffer(keepFrom: cutLength)
+                    
+                    messageLog = "Transcription: \(superBufferText)\n"
+                }
             }
                 
             await currentTranscriptionTask?.value
             isTranscribingChunk = false
         }
+    
+//    private func performCut() async {
+//        // Extract first 15s as stable
+//        let stableAudio = Array(audioBuffer.prefix(stableLength))
+//        
+//        // Transcribe stable portion
+//        await whisperContext?.fullTranscribe(samples: stableAudio)
+//        superBufferText = await whisperContext?.getTranscription() ?? ""
+//        
+//        // Keep samples for super buffer
+//        superBuffer = stableAudio
+//        
+//        // Rolling buffer = last 10s (includes 5s overlap)
+//        rollingBuffer = Array(audioBuffer.suffix(cutLength))
+//        
+//        // Clear main buffer
+//        audioBuffer = rollingBuffer
+//    }
+    
+    private func mergeWithOverlap(oldText: String, newText: String, overlapSeconds: Int) -> String {
+        if oldText.isEmpty || newText.isEmpty {
+            return oldText+newText
+        }
+        print("Old Text: \(oldText)\n")
+        print("New Text: \(newText)\n")
+        let oldWords = oldText.split(separator: " ").map(String.init)
+        let newWords = newText.split(separator: " ").map(String.init)
+        
+        // Estimate words in overlap region (roughly 2-3 words per second)
+        let overlapWordEstimate = overlapSeconds * 3
+        
+        
+        // Find best matching substring
+        if let (oldIdx, newIdx, matchLen) = findBestMatch(oldWords, newWords, overlapWordEstimate) {
+            // Merge at middle of match
+            let mergePoint = (matchLen+1) / 2
+//            let mergePoint = matchLen / 2
+
+            print("Match Len: \(matchLen)\n")
+            
+//            let keepFromOld = oldWords.count - overlapWordEstimate + oldIdx + mergePoint
+            let keepFromOld = oldIdx + mergePoint
+
+            let skipFromNew = newIdx + mergePoint
+            print("Old")
+            print(Array(oldWords.prefix(upTo: mergePoint+2)))
+            print("New")
+            print(Array(newWords.suffix(from: mergePoint-2)))
+            let merged = Array(oldWords.prefix(keepFromOld)) +
+                         Array(newWords.suffix(from: skipFromNew))
+            print("Merged: \(merged)\n")
+            return merged.joined(separator: " ")
+        }
+        
+        // No good overlap found - simple concat with space
+        return oldText + " " + newText
+    }
+    
+    private func normalizeWord(_ word: String) -> String {
+        return word.lowercased()
+            .trimmingCharacters(in: .punctuationCharacters)
+    }
+
+    private func findBestMatch(_ oldWords: [String], _ newWords: [String], _ overlapWordEstimate: Int) -> (Int, Int, Int)? {
+        var bestMatch: (oldIdx: Int, newIdx: Int, length: Int)? = nil
+        var maxLen = 0
+        
+        // Define search regions
+        let oldStartIdx = max(0, oldWords.count - overlapWordEstimate)
+        let newEndIdx = min(newWords.count, overlapWordEstimate)
+        
+        // Create normalized versions for matching
+        let oldWordsNormalized = oldWords.map { normalizeWord($0) }
+        let newWordsNormalized = newWords.map { normalizeWord($0) }
+        
+        // Sliding window to find longest common substring
+        for i in oldStartIdx..<oldWords.count {
+            for j in 0..<newEndIdx {
+                var len = 0
+                while i + len < oldWords.count &&
+                      j + len < newWords.count &&
+                        oldWordsNormalized[i + len] == newWordsNormalized[j + len] {
+                    len += 1
+                }
+                if len > maxLen && len >= 3 {  // Require at least 3 word match
+                    maxLen = len
+                    bestMatch = (i, j, len)
+                }
+            }
+        }
+        
+        return bestMatch
+    }
+    
+    private func findBestMatchWConfidence(_ arr1: [String], _ arr2: [String]) -> (Int, Int, Int)? {
+        var bestMatch: (oldIdx: Int, newIdx: Int, length: Int)? = nil
+        var maxLen = 0
+        var bestConfidence = 0.0
+        
+        let minOverlapSize = min(arr1.count, arr2.count)
+        
+        for i in 0..<arr1.count {
+            for j in 0..<arr2.count {
+                var len = 0
+                while i + len < arr1.count &&
+                      j + len < arr2.count &&
+                      arr1[i + len] == arr2[j + len] {
+                    len += 1
+                }
+                
+                if len >= 3 {
+                    // Calculate confidence metrics
+                    let lengthRatio = Double(len) / Double(minOverlapSize)  // 0.0 to 1.0
+                    
+                    // Prefer matches closer to center of overlap regions
+                    let centerScore1 = 1.0 - abs(Double(i + len/2) - Double(arr1.count/2)) / Double(arr1.count)
+                    let centerScore2 = 1.0 - abs(Double(j + len/2) - Double(arr2.count/2)) / Double(arr2.count)
+                    let positionScore = (centerScore1 + centerScore2) / 2.0
+                    
+                    // Combined confidence (weighted toward length)
+                    let confidence = (lengthRatio * 0.7) + (positionScore * 0.3)
+                    
+                    // Keep best match by length, use confidence as tiebreaker
+                    if len > maxLen || (len == maxLen && confidence > bestConfidence) {
+                        maxLen = len
+                        bestConfidence = confidence
+                        bestMatch = (i, j, len)
+                    }
+                }
+            }
+        }
+        
+        return bestMatch
+    }
         
 //        private func transcribeAudio(_ samples: [Float]) async {
 //            guard let whisperContext = whisperContext else { return }
@@ -257,7 +416,7 @@ class WhisperState: NSObject, ObservableObject, AVAudioRecorderDelegate {
 //        }
         
         // Implement your merge strategy here
-        private func mergeChunks(_ chunks: [String]) -> String {
+//        private func mergeChunks(_ chunks: [String]) -> String {
 //            guard chunks.count > 1 else {
 //                return chunks.first ?? ""
 //            }
@@ -269,10 +428,10 @@ class WhisperState: NSObject, ObservableObject, AVAudioRecorderDelegate {
 //            }
 //            
 //            return merged
-            return ""
-        }
+//            return ""
+//        }
         
-        private func mergeWithConvergence(_ seg1: String, _ seg2: String) -> String {
+//        private func mergeWithConvergence(_ seg1: String, _ seg2: String) -> String {
 //            // Implement your convergence-based merge strategy here
 //            // For now, simple concatenation
 //            // TODO: Add your sliding window comparison logic
@@ -296,10 +455,10 @@ class WhisperState: NSObject, ObservableObject, AVAudioRecorderDelegate {
 //            
 //            // No good overlap found, just concatenate
 //            return seg1 + " " + seg2
-            return ""
-        }
+//            return ""
+//        }
         
-        private func findOverlap(_ arr1: [String], _ arr2: [String]) -> Int? {
+//        private func findOverlap(_ arr1: [String], _ arr2: [String]) -> Int? {
 //            // Simplified - implement your sliding window similarity here
 //            for i in 0..<min(arr1.count, arr2.count) {
 //                if arr1[i] == arr2[i] {
@@ -307,8 +466,8 @@ class WhisperState: NSObject, ObservableObject, AVAudioRecorderDelegate {
 //                }
 //            }
 //            return nil
-            return 0
-        }
+//            return 0
+//        }
     
     private func requestRecordPermission(response: @escaping (Bool) -> Void) {
 #if os(macOS)

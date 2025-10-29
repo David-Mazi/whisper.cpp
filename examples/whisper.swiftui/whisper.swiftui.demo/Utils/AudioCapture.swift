@@ -23,6 +23,7 @@ actor AudioCapture {
     private let chunkSize: Int
     private let sampleRate: Double = 16000
     
+    
     init(chunkSizeSeconds: Int = 10, realtime: Bool = false) {
         self.chunkSize = Int(Double(chunkSizeSeconds) * sampleRate)
         self.isRealtime = realtime
@@ -31,6 +32,14 @@ actor AudioCapture {
     // Add this method to set the callback
     func setChunkCallback(_ callback: @escaping ([Float]) async -> Void) {
         self.onChunkReady = callback
+    }
+    
+    // Update Buffer
+    func cutAudioBuffer(keepFrom: Int) async {
+        if audioBuffer.count > keepFrom {
+            self.audioBuffer = Array(audioBuffer.suffix(from: keepFrom))
+        }
+        self.lastProcessedCount = audioBuffer.count
     }
     
     func startCapture() throws {
@@ -163,9 +172,7 @@ actor AudioCapture {
             outStatus.pointee = .haveData
             return buffer
         }
-        
-        print("⚠️ Audio conversion: \(from.sampleRate)Hz → \(to.sampleRate)Hz")
-        
+                
         if let error = error {
             print("⚠️ Conversion error: \(error)")
         }
