@@ -3,7 +3,7 @@
 	archiveVersion = 1;
 	classes = {
 	};
-	objectVersion = 56;
+	objectVersion = 70;
 	objects = {
 
 /* Begin PBXBuildFile section */
@@ -14,10 +14,8 @@
 		18627C8629052BE000BD2A04 /* Assets.xcassets in Resources */ = {isa = PBXBuildFile; fileRef = 18627C8529052BE000BD2A04 /* Assets.xcassets */; };
 		18627C8929052BE000BD2A04 /* LaunchScreen.storyboard in Resources */ = {isa = PBXBuildFile; fileRef = 18627C8729052BE000BD2A04 /* LaunchScreen.storyboard */; };
 		18627C8C29052BE000BD2A04 /* main.m in Sources */ = {isa = PBXBuildFile; fileRef = 18627C8B29052BE000BD2A04 /* main.m */; };
-		18627C9B29052CFF00BD2A04 /* ggml-base.en.bin in Resources */ = {isa = PBXBuildFile; fileRef = 18627C9A29052CFF00BD2A04 /* ggml-base.en.bin */; };
 		7FE3424B2A0C3FA20015A058 /* whisper-encoder-impl.m in Sources */ = {isa = PBXBuildFile; fileRef = 7FE342452A0C3FA20015A058 /* whisper-encoder-impl.m */; };
 		7FE3424C2A0C3FA20015A058 /* whisper-encoder.mm in Sources */ = {isa = PBXBuildFile; fileRef = 7FE342472A0C3FA20015A058 /* whisper-encoder.mm */; };
-		7FE3424F2A0C418A0015A058 /* ggml-base.en-encoder.mlmodelc in Resources */ = {isa = PBXBuildFile; fileRef = 7FE3424E2A0C418A0015A058 /* ggml-base.en-encoder.mlmodelc */; };
 		DDE3609F2D87EA8C004EA223 /* whisper.xcframework in Frameworks */ = {isa = PBXBuildFile; fileRef = DDE3609E2D87EA8C004EA223 /* whisper.xcframework */; };
 		DDE360A02D87EA8C004EA223 /* whisper.xcframework in Embed Frameworks */ = {isa = PBXBuildFile; fileRef = DDE3609E2D87EA8C004EA223 /* whisper.xcframework */; settings = {ATTRIBUTES = (CodeSignOnCopy, RemoveHeadersOnCopy, ); }; };
 /* End PBXBuildFile section */
@@ -70,6 +68,21 @@
 		DDE3609E2D87EA8C004EA223 /* whisper.xcframework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.xcframework; name = whisper.xcframework; path = "../../build-apple/whisper.xcframework"; sourceTree = "<group>"; };
 /* End PBXFileReference section */
 
+/* Begin PBXFileSystemSynchronizedBuildFileExceptionSet section */
+		465AABDC2EB022AB00A77A43 /* PBXFileSystemSynchronizedBuildFileExceptionSet */ = {
+			isa = PBXFileSystemSynchronizedBuildFileExceptionSet;
+			membershipExceptions = (
+				"models/ggml-base.en-encoder.mlmodelc",
+				"models/ggml-base.en.bin",
+			);
+			target = 18627C7529052BDF00BD2A04 /* whisper.objc */;
+		};
+/* End PBXFileSystemSynchronizedBuildFileExceptionSet section */
+
+/* Begin PBXFileSystemSynchronizedRootGroup section */
+		465AABD52EB0226000A77A43 /* Resources */ = {isa = PBXFileSystemSynchronizedRootGroup; exceptions = (465AABDC2EB022AB00A77A43 /* PBXFileSystemSynchronizedBuildFileExceptionSet */, ); explicitFileTypes = {}; explicitFolders = (); path = Resources; sourceTree = "<group>"; };
+/* End PBXFileSystemSynchronizedRootGroup section */
+
 /* Begin PBXFrameworksBuildPhase section */
 		18627C7329052BDF00BD2A04 /* Frameworks */ = {
 			isa = PBXFrameworksBuildPhase;
@@ -85,6 +98,7 @@
 		18627C6D29052BDF00BD2A04 = {
 			isa = PBXGroup;
 			children = (
+				465AABD52EB0226000A77A43 /* Resources */,
 				18627C7829052BDF00BD2A04 /* whisper.objc */,
 				DDE3609D2D87EA8C004EA223 /* Frameworks */,
 				18627C7729052BDF00BD2A04 /* Products */,
@@ -202,10 +216,8 @@
 			buildActionMask = 2147483647;
 			files = (
 				18627C8929052BE000BD2A04 /* LaunchScreen.storyboard in Resources */,
-				7FE3424F2A0C418A0015A058 /* ggml-base.en-encoder.mlmodelc in Resources */,
 				18627C8629052BE000BD2A04 /* Assets.xcassets in Resources */,
 				18627C8429052BDF00BD2A04 /* Main.storyboard in Resources */,
-				18627C9B29052CFF00BD2A04 /* ggml-base.en.bin in Resources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};

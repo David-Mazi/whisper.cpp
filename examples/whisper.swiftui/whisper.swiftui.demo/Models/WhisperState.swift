@@ -8,18 +8,25 @@ class WhisperState: NSObject, ObservableObject, AVAudioRecorderDelegate {
     @Published var messageLog = ""
     @Published var canTranscribe = false
     @Published var isRecording = false
+    @Published var isRealTimeTranscribing = false
     
     private var whisperContext: WhisperContext?
     private let recorder = Recorder()
     private var recordedFile: URL? = nil
     private var audioPlayer: AVAudioPlayer?
+    private var audioCapture: AudioCapture?
+    
+    // For chunked transcription
+    private var chunks: [String] = []
+    private var isTranscribingChunk = false
+    private var currentTranscriptionTask: Task<Void, Never>?
     
     private var builtInModelUrl: URL? {
         Bundle.main.url(forResource: "ggml-base.en", withExtension: "bin", subdirectory: "models")
     }
     
     private var sampleUrl: URL? {
-        Bundle.main.url(forResource: "jfk", withExtension: "wav", subdirectory: "samples")
+        Bundle.main.url(forResource: "david2", withExtension: "wav", subdirectory: "samples")
     }
     
     private enum LoadError: Error {
@@ -149,6 +156,159 @@ class WhisperState: NSObject, ObservableObject, AVAudioRecorderDelegate {
             }
         }
     }
+        
+        // ... existing code ...
+        
+        func toggleRealtimeTranscription() async {
+            if isRealTimeTranscribing {
+                await stopRTTranscribing()
+            } else {
+                await startRTTranscribing()
+            }
+        }
+        
+        private func startRTTranscribing() async {
+            requestRecordPermission { granted in
+                if granted {
+                    Task {
+                        do {
+                            // Create audio capture
+                            self.audioCapture = AudioCapture(
+                                chunkSizeSeconds: 1,
+                                realtime: true
+                            )
+                            
+                            // Set up chunk callback for real-time
+                            await self.audioCapture?.setChunkCallback { [weak self] chunk in
+                                await self?.transcribeChunk(chunk)
+                            }
+                            
+                            try await self.audioCapture?.startCapture()
+                            self.isRealTimeTranscribing = true
+                            self.chunks = []
+                            self.messageLog += "Transcription started...\n"
+                            
+                        } catch {
+                            self.messageLog += "Error starting transcription: \(error.localizedDescription)\n"
+                        }
+                    }
+                }
+            }
+        }
+        
+        private func stopRTTranscribing() async {
+            guard let audioCapture = audioCapture else { return }
+            
+            let finalSamples = await audioCapture.stopCapture()
+            isRealTimeTranscribing = false
+            
+            // Wait for any in-progress chunk
+            await currentTranscriptionTask?.value
+            
+            // Process any remaining audio
+            if !finalSamples.isEmpty {
+                await transcribeChunk(finalSamples)
+            }
+            
+            // Merge all chunks using your convergence strategy
+//            let finalText = mergeChunks(chunks)
+            let finalText = chunks.joined(separator: " ")
+            messageLog += "\n=== Final Transcription ===\n\(finalText)\n"
+            
+            self.audioCapture = nil
+        }
+        
+        private func transcribeChunk(_ samples: [Float]) async {
+            guard !isTranscribingChunk else {
+                print("Already transcribing, skipping chunk")
+                return
+            }
+            
+            guard let whisperContext = whisperContext else { return }
+            
+            isTranscribingChunk = true
+            
+            currentTranscriptionTask = Task {
+                // Transcribe this chunk
+                await whisperContext.fullTranscribe(samples: samples)
+                let text = await whisperContext.getTranscription()
+                
+                chunks.append(text)
+                
+                // Show progressive results
+                messageLog += "[\(chunks.count)]: \(text)\n"
+                
+            }
+                
+            await currentTranscriptionTask?.value
+            isTranscribingChunk = false
+        }
+        
+//        private func transcribeAudio(_ samples: [Float]) async {
+//            guard let whisperContext = whisperContext else { return }
+//            
+//            canTranscribe = false
+//            
+//            await whisperContext.fullTranscribe(samples: samples)
+//            let text = await whisperContext.getTranscription()
+//            
+//            messageLog += "Done: \(text)\n"
+//            canTranscribe = true
+//        }
+        
+        // Implement your merge strategy here
+        private func mergeChunks(_ chunks: [String]) -> String {
+//            guard chunks.count > 1 else {
+//                return chunks.first ?? ""
+//            }
+//            
+//            var merged = chunks[0]
+//            
+//            for i in 1..<chunks.count {
+//                merged = mergeWithConvergence(merged, chunks[i])
+//            }
+//            
+//            return merged
+            return ""
+        }
+        
+        private func mergeWithConvergence(_ seg1: String, _ seg2: String) -> String {
+//            // Implement your convergence-based merge strategy here
+//            // For now, simple concatenation
+//            // TODO: Add your sliding window comparison logic
+//            
+//            let words1 = seg1.split(separator: " ").map(String.init)
+//            let words2 = seg2.split(separator: " ").map(String.init)
+//            
+//            // Simple overlap detection (you'll enhance this)
+//            let overlapSize = min(20, words1.count / 3)
+//            let seg1End = Array(words1.suffix(overlapSize))
+//            let seg2Start = Array(words2.prefix(overlapSize))
+//            
+//            // Find best match (simplified - use your algorithm)
+//            if let overlapIndex = findOverlap(seg1End, seg2Start) {
+//                let mergePoint1 = words1.count - overlapSize + overlapIndex
+//                let mergePoint2 = overlapIndex
+//                
+//                let merged = words1[0..<mergePoint1] + words2[mergePoint2...]
+//                return merged.joined(separator: " ")
+//            }
+//            
+//            // No good overlap found, just concatenate
+//            return seg1 + " " + seg2
+            return ""
+        }
+        
+        private func findOverlap(_ arr1: [String], _ arr2: [String]) -> Int? {
+//            // Simplified - implement your sliding window similarity here
+//            for i in 0..<min(arr1.count, arr2.count) {
+//                if arr1[i] == arr2[i] {
+//                    return i
+//                }
+//            }
+//            return nil
+            return 0
+        }
     
     private func requestRecordPermission(response: @escaping (Bool) -> Void) {
 #if os(macOS)
