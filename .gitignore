@@ -25,6 +25,8 @@ tmp/
 ggml-metal-embed.metal
 ggml-metal-embed.metal.tmp
 
+*.bin
+
 /main
 /stream
 /command
