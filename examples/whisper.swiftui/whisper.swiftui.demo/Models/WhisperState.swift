@@ -1,6 +1,7 @@
 import Foundation
 import SwiftUI
 import AVFoundation
+import Accelerate
 
 @MainActor
 class WhisperState: NSObject, ObservableObject, AVAudioRecorderDelegate {
@@ -34,7 +35,18 @@ class WhisperState: NSObject, ObservableObject, AVAudioRecorderDelegate {
     private let cutLength: Int = 160_000    // 10s Mark at 16kHz
     private let overlapLength: Int = 80_000 // 5s at 16kHz
     
-    private var builtInModelUrl: URL? {
+    // Silence Detection
+    private var silenceStartFrame: Int?
+    private var totalFramesProcessed: Int = 0
+    private let silenceThreshold: Float = 0.03
+    private let silenceDuration: TimeInterval = 1.0
+    private let sampleRate: Double = 16000.0 // Set to your actual sample rate
+    
+    private var builtInTinyModelUrl: URL? {
+        Bundle.main.url(forResource: "ggml-tiny.en-q5_1", withExtension: "bin", subdirectory: "models")
+    }
+    
+    private var builtInBaseModelUrl: URL? {
         Bundle.main.url(forResource: "ggml-base.en", withExtension: "bin", subdirectory: "models")
     }
     
@@ -49,13 +61,41 @@ class WhisperState: NSObject, ObservableObject, AVAudioRecorderDelegate {
     override init() {
         super.init()
         loadModel()
+        
+        
+        // Setup AutoListener
+        requestRecordPermission { granted in
+            if granted {
+                Task {
+                    do {
+                        // Create audio capture
+                        self.audioCapture = AudioCapture(
+                            chunkSizeSeconds: 1,
+                            realtime: true
+                        )
+                        
+                        // Set up chunk callback for real-time
+                        await self.audioCapture?.setChunkCallback { [weak self] chunk in
+                            await self?.detectCommandTriggers(chunk)
+                        }
+                        
+                        try await self.audioCapture?.startCapture()
+                        self.messageLog = "Listening...\n"
+                        self.superBufferText = ""
+                        
+                    } catch {
+                        self.messageLog = "Error starting listening: \(error.localizedDescription)\n"
+                    }
+                }
+            }
+        }
     }
     
-    func loadModel(path: URL? = nil, log: Bool = true) {
+    func loadModel(path: URL? = nil, log: Bool = true, type: String = "tiny") {
         do {
             whisperContext = nil
             if (log) { messageLog += "Loading model...\n" }
-            let modelUrl = path ?? builtInModelUrl
+            let modelUrl = path ?? (type == "tiny" ? builtInTinyModelUrl : builtInBaseModelUrl)
             if let modelUrl {
                 whisperContext = try WhisperContext.createContext(path: modelUrl.path())
                 if (log) { messageLog += "Loaded model \(modelUrl.lastPathComponent)\n" }
@@ -186,6 +226,7 @@ class WhisperState: NSObject, ObservableObject, AVAudioRecorderDelegate {
                     Task {
                         do {
                             // Create audio capture
+                            await self.audioCapture?.stopCapture()
                             self.audioCapture = AudioCapture(
                                 chunkSizeSeconds: 1,
                                 realtime: true
@@ -195,6 +236,7 @@ class WhisperState: NSObject, ObservableObject, AVAudioRecorderDelegate {
                             await self.audioCapture?.setChunkCallback { [weak self] chunk in
                                 await self?.transcribeChunk(chunk)
                             }
+                            await self.audioCapture?.setChunkSize(chunkSizeSeconds: 1)
                             
                             try await self.audioCapture?.startCapture()
                             self.isRealTimeTranscribing = true
@@ -231,6 +273,162 @@ class WhisperState: NSObject, ObservableObject, AVAudioRecorderDelegate {
             
             self.audioCapture = nil
         }
+    
+        private func detectCommandTriggers(_ samples: [Float]) async {
+            guard !isTranscribingChunk else {
+                print("Already transcribing, skipping command detection...")
+                return
+            }
+                        
+            guard let whisperContext = whisperContext else { return }
+            let startCommands: Set = ["start command", "start commands", "starts command", "starts commands", "stat command", "stat commands", "stats command", "stats commands", "begin command", "begin commands", "begins command", "begins commands"]
+            
+            isTranscribingChunk = true
+            
+            currentTranscriptionTask = Task {
+                // Transcribe this chunk
+                await whisperContext.fullTranscribe(samples: samples)
+                let text = await whisperContext.getTranscription()
+//                self.messageLog = text
+                for command in startCommands {
+                    if text.lowercased().contains(command) {
+                        await self.audioCapture?.stopCapture()
+                        isTranscribingChunk = false
+                        loadModel(type: "base")
+                        do {
+                            // empty audio capture pipeline for commands
+                            await self.audioCapture?.emptyAudioBuffer()
+                            self.superBufferText = ""
+                            
+                            // Set up callback for command processing
+                            await self.audioCapture?.setChunkSize(chunkSizeSeconds: 1)
+
+                            await self.audioCapture?.setChunkCallback { [weak self] chunk in
+                                await self?.runAudioCommand(chunk)
+                            }
+
+                            try await self.audioCapture?.startCapture()
+                            self.messageLog = "Activation Sequence Detected: Awaiting Command..."
+                        } catch {
+                            self.messageLog = "Error starting listening: \(error.localizedDescription)\n"
+                        }
+                        break
+                    }
+                }
+            }
+                
+            await currentTranscriptionTask?.value
+            isTranscribingChunk = false
+            if samples.count > 16000 {
+                await self.audioCapture?.cutAudioBuffer(keepFrom: samples.count - 16000) // Key command check only considers last 1s of audio
+            }
+        }
+    
+    private func runAudioCommand(_ samples: [Float]) async {
+        guard !isTranscribingChunk else {
+            print("Already transcribing, skipping command detection...")
+            return
+        }
+                    
+        guard let whisperContext = whisperContext else { return }
+        let endCommands: Set = ["end of command", "end commands", "end of commands", "and of command", "and commands", "and of command"]
+        
+        isTranscribingChunk = true
+        
+        currentTranscriptionTask = Task {
+            // Transcribe this chunk
+            await whisperContext.fullTranscribe(samples: samples)
+            var text = removingBracketedContent(await whisperContext.getTranscription()).lowercased()
+            
+            self.messageLog = text
+            
+            // Normal Text Merge Stuff
+            // Phase 1: Before super buffer exists (buffer < 20s)
+            if samples.count < rollingMax {
+                // UI shows: superBufferText + rollingBufferText only via merge
+//                messageLog = "Transcription: \(mergeWithOverlap(oldText: superBufferText, newText: text, overlapSeconds: 10))\n"
+            }
+            
+            // Phase 2: Cutting (buffer hits 20s)
+            else {
+                // We trim buffer to keep calculations short and show superBufferText + rollingBufferText (merged)
+                superBufferText = mergeWithOverlap(oldText: superBufferText, newText: text, overlapSeconds: 10)
+                await self.audioCapture?.cutAudioBuffer(keepFrom: cutLength)
+                
+//                messageLog = "Transcription: \(superBufferText)\n"
+            }
+            
+//            await whisperContext.fullTranscribe(samples: Array(samples.suffix(
+//                from: samples.count - 24000 > 1 ? samples.count - 24000 : 0
+//            ))) // Check last 1.5s of audio
+//            let checkForSilence = removingBracketedContent(await whisperContext.getTranscription()).isEmpty
+            let checkForSilence: Bool = detectSilence(
+                in: Array(samples.suffix(from: samples.count - 24000 > 1 ? samples.count - 24000 : 0
+            )))
+            self.messageLog += checkForSilence ?  "\nSilence detected\n" : "\nNo silence detected\n"
+            if checkForSilence && (!superBufferText.isEmpty || !removingBracketedContent(text).isEmpty) {
+                for command in endCommands {
+                    if superBufferText.isEmpty {
+                        text = text.replacingOccurrences(of: command, with: "", options: .caseInsensitive)
+                    } else {
+                        superBufferText = superBufferText.replacingOccurrences(of: command, with: "", options: .caseInsensitive)
+                    }
+                }
+                await self.audioCapture?.stopCapture()
+                isTranscribingChunk = false
+                loadModel(type: "tiny")
+                do {
+                    // empty audio capture pipeline for commands
+                    await self.audioCapture?.emptyAudioBuffer()
+                    
+                    // Set up callback for command processing
+                    await self.audioCapture?.setChunkSize(chunkSizeSeconds: 1)
+                    await self.audioCapture?.setChunkCallback { [weak self] chunk in
+                        await self?.detectCommandTriggers(chunk)
+                    }
+                    
+                    try await self.audioCapture?.startCapture()
+                    self.messageLog += "We Heard: \(!superBufferText.isEmpty ? superBufferText : text)\n"
+                } catch {
+                    self.messageLog = "Error starting listening: \(error.localizedDescription)\n"
+                }
+            } else {
+                for command in endCommands {
+                    if text.lowercased().contains(command) {
+                        await self.audioCapture?.stopCapture()
+                        isTranscribingChunk = false
+                        loadModel(type: "tiny")
+                        do {
+                            // empty audio capture pipeline for commands
+                            await self.audioCapture?.emptyAudioBuffer()
+                            
+                            // Set up callback for command processing
+                            await self.audioCapture?.setChunkSize(chunkSizeSeconds: 1)
+                            await self.audioCapture?.setChunkCallback { [weak self] chunk in
+                                await self?.detectCommandTriggers(chunk)
+                            }
+                            
+                            try await self.audioCapture?.startCapture()
+                            for command in endCommands {
+                                if superBufferText.isEmpty {
+                                    text = text.replacingOccurrences(of: command, with: "", options: .caseInsensitive)
+                                } else {
+                                    superBufferText = superBufferText.replacingOccurrences(of: command, with: "", options: .caseInsensitive)
+                                }
+                            }
+                            self.messageLog = "We Heard: \(!superBufferText.isEmpty ? superBufferText : text)\n"
+                        } catch {
+                            self.messageLog = "Error starting listening: \(error.localizedDescription)\n"
+                        }
+                        break
+                    }
+                }
+            }
+        }
+            
+        await currentTranscriptionTask?.value
+        isTranscribingChunk = false
+    }
         
         private func transcribeChunk(_ samples: [Float]) async {
             guard !isTranscribingChunk else {
@@ -330,6 +528,26 @@ class WhisperState: NSObject, ObservableObject, AVAudioRecorderDelegate {
         return word.lowercased()
             .trimmingCharacters(in: .punctuationCharacters)
     }
+                                                
+    private func removingBracketedContent(_ text: String) -> String {
+        var result = text
+        
+        // Remove [...] and their contents
+        result = result.replacingOccurrences(
+            of: "\\[[^\\]]*\\]",
+            with: "",
+            options: .regularExpression
+        )
+        
+        // Remove {...} and their contents
+        result = result.replacingOccurrences(
+            of: "\\{[^\\}]*\\}",
+            with: "",
+            options: .regularExpression
+        )
+        
+        return result.trimmingCharacters(in: .whitespacesAndNewlines)
+    }
 
     private func findBestMatch(_ oldWords: [String], _ newWords: [String], _ overlapWordEstimate: Int) -> (Int, Int, Int)? {
         var bestMatch: (oldIdx: Int, newIdx: Int, length: Int)? = nil
@@ -402,6 +620,38 @@ class WhisperState: NSObject, ObservableObject, AVAudioRecorderDelegate {
         
         return bestMatch
     }
+
+    func detectSilence(in samples: [Float]) -> Bool {
+        guard !samples.isEmpty else { return true }
+        var rms: Float = 0
+        vDSP_rmsqv(samples, 1, &rms, vDSP_Length(samples.count))
+        return rms < silenceThreshold
+//        let frameCount = samples.count
+//        
+//        // Calculate RMS using Accelerate
+//        var rms: Float = 0
+//        vDSP_rmsqv(samples, 1, &rms, vDSP_Length(frameCount))
+//        
+//        // Update total frames first
+//        totalFramesProcessed += frameCount
+//        
+//        // Check if current buffer is silent
+//        if rms < silenceThreshold {
+//            if silenceStartFrame == nil {
+//                silenceStartFrame = totalFramesProcessed - frameCount
+//            }
+//            
+//            // Calculate silence duration
+//            let silenceFrameCount = totalFramesProcessed - silenceStartFrame!
+//            let silenceSeconds = Double(silenceFrameCount) / sampleRate
+//            
+//            return silenceSeconds >= silenceDuration
+//        } else {
+//            silenceStartFrame = nil
+//            return false
+//        }
+    }
+
         
 //        private func transcribeAudio(_ samples: [Float]) async {
 //            guard let whisperContext = whisperContext else { return }

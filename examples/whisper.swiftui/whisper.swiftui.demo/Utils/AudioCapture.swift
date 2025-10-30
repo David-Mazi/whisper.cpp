@@ -20,7 +20,7 @@ actor AudioCapture {
 
     // Real-time vs batch mode
     private var isRealtime: Bool = false
-    private let chunkSize: Int
+    private var chunkSize: Int
     private let sampleRate: Double = 16000
     
     
@@ -40,6 +40,16 @@ actor AudioCapture {
             self.audioBuffer = Array(audioBuffer.suffix(from: keepFrom))
         }
         self.lastProcessedCount = audioBuffer.count
+    }
+    
+    // Empty Buffer
+    func emptyAudioBuffer() async {
+        self.audioBuffer = []
+        self.lastProcessedCount = audioBuffer.count
+    }
+    
+    func setChunkSize(chunkSizeSeconds: Int = 1) {
+        self.chunkSize = Int(Double(chunkSizeSeconds) * sampleRate)
     }
     
     func startCapture() throws {
