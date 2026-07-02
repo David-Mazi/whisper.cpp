@@ -23,7 +23,15 @@ struct ContentView: View {
                         }
                     })
                     .buttonStyle(.bordered)
-                    .disabled(!whisperState.canTranscribe)
+                    .disabled(!whisperState.canTranscribe || whisperState.isRealTimeTranscribing)
+                    
+                    Button(whisperState.isRealTimeTranscribing ? "Stop transcription" : "Start transcription", action: {
+                        Task {
+                            await whisperState.toggleRealtimeTranscription()
+                        }
+                    })
+                    .buttonStyle(.bordered)
+                    .disabled(!whisperState.canTranscribe || whisperState.isRecording)
                 }
                 
                 ScrollView {

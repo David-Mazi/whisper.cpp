@@ -20,7 +20,8 @@ actor WhisperContext {
 
     func fullTranscribe(samples: [Float]) {
         // Leave 2 processors free (i.e. the high-efficiency cores).
-        let maxThreads = max(1, min(8, cpuCount() - 2))
+//        let maxThreads = max(1, min(8, cpuCount() - 2))
+        let maxThreads = min(8, cpuCount())
         print("Selecting \(maxThreads) threads")
         var params = whisper_full_default_params(WHISPER_SAMPLING_GREEDY)
         "en".withCString { en in

@@ -314,4 +314,24 @@ void AudioInputCallback(void * inUserData,
     }
 }
 
+//// Keep a circular buffer, only transcribe last N seconds
+//#define SLIDING_WINDOW_SEC 10
+//#define MAX_RECORDING_SEC 300  // 5 minutes total
+//
+//- (IBAction)onTranscribe:(id)sender {
+//    // Only transcribe the last 10 seconds
+//    int window_samples = SLIDING_WINDOW_SEC * SAMPLE_RATE;
+//    int start_sample = MAX(0, stateInp.n_samples - window_samples);
+//    int n_to_process = MIN(window_samples, stateInp.n_samples);
+//    
+//    // Transcribe just the window
+//    whisper_full(ctx, params,
+//                 &audioBufferF32[start_sample],  // Start from offset
+//                 n_to_process);                   // Only process window
+//    
+//    // Append new text (need deduplication logic!)
+//    NSString *newText = extractNewSegments();
+//    result = [previousResult stringByAppendingString:newText];
+//}
+
 @end

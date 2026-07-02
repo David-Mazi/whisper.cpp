@@ -1,6 +1,7 @@
 import Foundation
 import SwiftUI
 import AVFoundation
+import Accelerate
 
 @MainActor
 class WhisperState: NSObject, ObservableObject, AVAudioRecorderDelegate {
@@ -8,18 +9,49 @@ class WhisperState: NSObject, ObservableObject, AVAudioRecorderDelegate {
     @Published var messageLog = ""
     @Published var canTranscribe = false
     @Published var isRecording = false
+    @Published var isRealTimeTranscribing = false
     
     private var whisperContext: WhisperContext?
     private let recorder = Recorder()
     private var recordedFile: URL? = nil
     private var audioPlayer: AVAudioPlayer?
+    private var audioCapture: AudioCapture?
     
-    private var builtInModelUrl: URL? {
+    // For chunked transcription
+    private var chunks: [String] = []
+    private var isTranscribingChunk = false
+    private var currentTranscriptionTask: Task<Void, Never>?
+    
+    // Merge Strategy Constants
+    private var rollingBuffer: [Float] = []           // 10-20s audio samples
+    private var superBuffer: [Float] = []             // Accumulated stable audio
+    private var superBufferText: String = ""          // Stable transcription
+    private var rollingBufferText: String = ""        // Current rolling transcription
+
+    // Timing constants
+    private let rollingMin: Int = 160_000   // 10s at 16kHz
+    private let rollingMax: Int = 320_000   // 20s at 16kHz
+    private let stableLength: Int = 240_000 // 15s at 16kHz
+    private let cutLength: Int = 160_000    // 10s Mark at 16kHz
+    private let overlapLength: Int = 80_000 // 5s at 16kHz
+    
+    // Silence Detection
+    private var silenceStartFrame: Int?
+    private var totalFramesProcessed: Int = 0
+    private let silenceThreshold: Float = 0.03
+    private let silenceDuration: TimeInterval = 1.0
+    private let sampleRate: Double = 16000.0 // Set to your actual sample rate
+    
+    private var builtInTinyModelUrl: URL? {
+        Bundle.main.url(forResource: "ggml-tiny.en-q5_1", withExtension: "bin", subdirectory: "models")
+    }
+    
+    private var builtInBaseModelUrl: URL? {
         Bundle.main.url(forResource: "ggml-base.en", withExtension: "bin", subdirectory: "models")
     }
     
     private var sampleUrl: URL? {
-        Bundle.main.url(forResource: "jfk", withExtension: "wav", subdirectory: "samples")
+        Bundle.main.url(forResource: "david2", withExtension: "wav", subdirectory: "samples")
     }
     
     private enum LoadError: Error {
@@ -29,13 +61,41 @@ class WhisperState: NSObject, ObservableObject, AVAudioRecorderDelegate {
     override init() {
         super.init()
         loadModel()
+        
+        
+        // Setup AutoListener
+        requestRecordPermission { granted in
+            if granted {
+                Task {
+                    do {
+                        // Create audio capture
+                        self.audioCapture = AudioCapture(
+                            chunkSizeSeconds: 1,
+                            realtime: true
+                        )
+                        
+                        // Set up chunk callback for real-time
+                        await self.audioCapture?.setChunkCallback { [weak self] chunk in
+                            await self?.detectCommandTriggers(chunk)
+                        }
+                        
+                        try await self.audioCapture?.startCapture()
+                        self.messageLog = "Listening...\n"
+                        self.superBufferText = ""
+                        
+                    } catch {
+                        self.messageLog = "Error starting listening: \(error.localizedDescription)\n"
+                    }
+                }
+            }
+        }
     }
     
-    func loadModel(path: URL? = nil, log: Bool = true) {
+    func loadModel(path: URL? = nil, log: Bool = true, type: String = "tiny") {
         do {
             whisperContext = nil
             if (log) { messageLog += "Loading model...\n" }
-            let modelUrl = path ?? builtInModelUrl
+            let modelUrl = path ?? (type == "tiny" ? builtInTinyModelUrl : builtInBaseModelUrl)
             if let modelUrl {
                 whisperContext = try WhisperContext.createContext(path: modelUrl.path())
                 if (log) { messageLog += "Loaded model \(modelUrl.lastPathComponent)\n" }
@@ -149,6 +209,515 @@ class WhisperState: NSObject, ObservableObject, AVAudioRecorderDelegate {
             }
         }
     }
+        
+        // ... existing code ...
+        
+        func toggleRealtimeTranscription() async {
+            if isRealTimeTranscribing {
+                await stopRTTranscribing()
+            } else {
+                await startRTTranscribing()
+            }
+        }
+        
+        private func startRTTranscribing() async {
+            requestRecordPermission { granted in
+                if granted {
+                    Task {
+                        do {
+                            // Create audio capture
+                            await self.audioCapture?.stopCapture()
+                            self.audioCapture = AudioCapture(
+                                chunkSizeSeconds: 1,
+                                realtime: true
+                            )
+                            
+                            // Set up chunk callback for real-time
+                            await self.audioCapture?.setChunkCallback { [weak self] chunk in
+                                await self?.transcribeChunk(chunk)
+                            }
+                            await self.audioCapture?.setChunkSize(chunkSizeSeconds: 1)
+                            
+                            try await self.audioCapture?.startCapture()
+                            self.isRealTimeTranscribing = true
+                            self.chunks = []
+                            self.messageLog = "Transcription started...\n"
+                            self.superBufferText = ""
+                            
+                        } catch {
+                            self.messageLog = "Error starting transcription: \(error.localizedDescription)\n"
+                        }
+                    }
+                }
+            }
+        }
+        
+        private func stopRTTranscribing() async {
+            guard let audioCapture = audioCapture else { return }
+            
+            let finalSamples = await audioCapture.stopCapture()
+            isRealTimeTranscribing = false
+            
+            // Wait for any in-progress chunk
+            await currentTranscriptionTask?.value
+            
+            // Process any remaining audio
+            if !finalSamples.isEmpty {
+                await transcribeChunk(finalSamples)
+            }
+            
+            // Merge all chunks using your convergence strategy
+//            let finalText = mergeChunks(chunks)
+//            let finalText = chunks.joined(separator: " ")
+//            messageLog += "\n=== Final Transcription ===\n\(finalText)\n"
+            
+            self.audioCapture = nil
+        }
+    
+        private func detectCommandTriggers(_ samples: [Float]) async {
+            guard !isTranscribingChunk else {
+                print("Already transcribing, skipping command detection...")
+                return
+            }
+                        
+            guard let whisperContext = whisperContext else { return }
+            let startCommands: Set = ["start command", "start commands", "starts command", "starts commands", "stat command", "stat commands", "stats command", "stats commands", "begin command", "begin commands", "begins command", "begins commands"]
+            
+            isTranscribingChunk = true
+            
+            currentTranscriptionTask = Task {
+                // Transcribe this chunk
+                await whisperContext.fullTranscribe(samples: samples)
+                let text = await whisperContext.getTranscription()
+//                self.messageLog = text
+                for command in startCommands {
+                    if text.lowercased().contains(command) {
+                        await self.audioCapture?.stopCapture()
+                        isTranscribingChunk = false
+                        loadModel(type: "base")
+                        do {
+                            // empty audio capture pipeline for commands
+                            await self.audioCapture?.emptyAudioBuffer()
+                            self.superBufferText = ""
+                            
+                            // Set up callback for command processing
+                            await self.audioCapture?.setChunkSize(chunkSizeSeconds: 1)
+
+                            await self.audioCapture?.setChunkCallback { [weak self] chunk in
+                                await self?.runAudioCommand(chunk)
+                            }
+
+                            try await self.audioCapture?.startCapture()
+                            self.messageLog = "Activation Sequence Detected: Awaiting Command..."
+                        } catch {
+                            self.messageLog = "Error starting listening: \(error.localizedDescription)\n"
+                        }
+                        break
+                    }
+                }
+            }
+                
+            await currentTranscriptionTask?.value
+            isTranscribingChunk = false
+            if samples.count > 16000 {
+                await self.audioCapture?.cutAudioBuffer(keepFrom: samples.count - 16000) // Key command check only considers last 1s of audio
+            }
+        }
+    
+    private func runAudioCommand(_ samples: [Float]) async {
+        guard !isTranscribingChunk else {
+            print("Already transcribing, skipping command detection...")
+            return
+        }
+                    
+        guard let whisperContext = whisperContext else { return }
+        let endCommands: Set = ["end of command", "end commands", "end of commands", "and of command", "and commands", "and of command"]
+        
+        isTranscribingChunk = true
+        
+        currentTranscriptionTask = Task {
+            // Transcribe this chunk
+            await whisperContext.fullTranscribe(samples: samples)
+            var text = removingBracketedContent(await whisperContext.getTranscription()).lowercased()
+            
+            self.messageLog = text
+            
+            // Normal Text Merge Stuff
+            // Phase 1: Before super buffer exists (buffer < 20s)
+            if samples.count < rollingMax {
+                // UI shows: superBufferText + rollingBufferText only via merge
+//                messageLog = "Transcription: \(mergeWithOverlap(oldText: superBufferText, newText: text, overlapSeconds: 10))\n"
+            }
+            
+            // Phase 2: Cutting (buffer hits 20s)
+            else {
+                // We trim buffer to keep calculations short and show superBufferText + rollingBufferText (merged)
+                superBufferText = mergeWithOverlap(oldText: superBufferText, newText: text, overlapSeconds: 10)
+                await self.audioCapture?.cutAudioBuffer(keepFrom: cutLength)
+                
+//                messageLog = "Transcription: \(superBufferText)\n"
+            }
+            
+//            await whisperContext.fullTranscribe(samples: Array(samples.suffix(
+//                from: samples.count - 24000 > 1 ? samples.count - 24000 : 0
+//            ))) // Check last 1.5s of audio
+//            let checkForSilence = removingBracketedContent(await whisperContext.getTranscription()).isEmpty
+            let checkForSilence: Bool = detectSilence(
+                in: Array(samples.suffix(from: samples.count - 24000 > 1 ? samples.count - 24000 : 0
+            )))
+            self.messageLog += checkForSilence ?  "\nSilence detected\n" : "\nNo silence detected\n"
+            if checkForSilence && (!superBufferText.isEmpty || !removingBracketedContent(text).isEmpty) {
+                for command in endCommands {
+                    if superBufferText.isEmpty {
+                        text = text.replacingOccurrences(of: command, with: "", options: .caseInsensitive)
+                    } else {
+                        superBufferText = superBufferText.replacingOccurrences(of: command, with: "", options: .caseInsensitive)
+                    }
+                }
+                await self.audioCapture?.stopCapture()
+                isTranscribingChunk = false
+                loadModel(type: "tiny")
+                do {
+                    // empty audio capture pipeline for commands
+                    await self.audioCapture?.emptyAudioBuffer()
+                    
+                    // Set up callback for command processing
+                    await self.audioCapture?.setChunkSize(chunkSizeSeconds: 1)
+                    await self.audioCapture?.setChunkCallback { [weak self] chunk in
+                        await self?.detectCommandTriggers(chunk)
+                    }
+                    
+                    try await self.audioCapture?.startCapture()
+                    self.messageLog += "We Heard: \(!superBufferText.isEmpty ? superBufferText : text)\n"
+                } catch {
+                    self.messageLog = "Error starting listening: \(error.localizedDescription)\n"
+                }
+            } else {
+                for command in endCommands {
+                    if text.lowercased().contains(command) {
+                        await self.audioCapture?.stopCapture()
+                        isTranscribingChunk = false
+                        loadModel(type: "tiny")
+                        do {
+                            // empty audio capture pipeline for commands
+                            await self.audioCapture?.emptyAudioBuffer()
+                            
+                            // Set up callback for command processing
+                            await self.audioCapture?.setChunkSize(chunkSizeSeconds: 1)
+                            await self.audioCapture?.setChunkCallback { [weak self] chunk in
+                                await self?.detectCommandTriggers(chunk)
+                            }
+                            
+                            try await self.audioCapture?.startCapture()
+                            for command in endCommands {
+                                if superBufferText.isEmpty {
+                                    text = text.replacingOccurrences(of: command, with: "", options: .caseInsensitive)
+                                } else {
+                                    superBufferText = superBufferText.replacingOccurrences(of: command, with: "", options: .caseInsensitive)
+                                }
+                            }
+                            self.messageLog = "We Heard: \(!superBufferText.isEmpty ? superBufferText : text)\n"
+                        } catch {
+                            self.messageLog = "Error starting listening: \(error.localizedDescription)\n"
+                        }
+                        break
+                    }
+                }
+            }
+        }
+            
+        await currentTranscriptionTask?.value
+        isTranscribingChunk = false
+    }
+        
+        private func transcribeChunk(_ samples: [Float]) async {
+            guard !isTranscribingChunk else {
+                print("Already transcribing, skipping chunk")
+                return
+            }
+                        
+            guard let whisperContext = whisperContext else { return }
+            
+            isTranscribingChunk = true
+            
+            currentTranscriptionTask = Task {
+                // Transcribe this chunk
+                await whisperContext.fullTranscribe(samples: samples)
+                let text = await whisperContext.getTranscription()
+                
+                chunks.append(text)
+                
+                // Phase 1: Before super buffer exists (buffer < 20s)
+                if samples.count < rollingMax {
+                    // UI shows: superBufferText + rollingBufferText only via merge
+                    messageLog = "Transcription: \(mergeWithOverlap(oldText: superBufferText, newText: text, overlapSeconds: 10))\n"
+                }
+                
+                // Phase 2: Cutting (buffer hits 20s)
+                else {
+                    // We trim buffer to keep calculations short and show superBufferText + rollingBufferText (merged)
+                    superBufferText = mergeWithOverlap(oldText: superBufferText, newText: text, overlapSeconds: 10)
+                    await self.audioCapture?.cutAudioBuffer(keepFrom: cutLength)
+                    
+                    messageLog = "Transcription: \(superBufferText)\n"
+                }
+            }
+                
+            await currentTranscriptionTask?.value
+            isTranscribingChunk = false
+        }
+    
+//    private func performCut() async {
+//        // Extract first 15s as stable
+//        let stableAudio = Array(audioBuffer.prefix(stableLength))
+//        
+//        // Transcribe stable portion
+//        await whisperContext?.fullTranscribe(samples: stableAudio)
+//        superBufferText = await whisperContext?.getTranscription() ?? ""
+//        
+//        // Keep samples for super buffer
+//        superBuffer = stableAudio
+//        
+//        // Rolling buffer = last 10s (includes 5s overlap)
+//        rollingBuffer = Array(audioBuffer.suffix(cutLength))
+//        
+//        // Clear main buffer
+//        audioBuffer = rollingBuffer
+//    }
+    
+    private func mergeWithOverlap(oldText: String, newText: String, overlapSeconds: Int) -> String {
+        if oldText.isEmpty || newText.isEmpty {
+            return oldText+newText
+        }
+        print("Old Text: \(oldText)\n")
+        print("New Text: \(newText)\n")
+        let oldWords = oldText.split(separator: " ").map(String.init)
+        let newWords = newText.split(separator: " ").map(String.init)
+        
+        // Estimate words in overlap region (roughly 2-3 words per second)
+        let overlapWordEstimate = overlapSeconds * 3
+        
+        
+        // Find best matching substring
+        if let (oldIdx, newIdx, matchLen) = findBestMatch(oldWords, newWords, overlapWordEstimate) {
+            // Merge at middle of match
+            let mergePoint = (matchLen+1) / 2
+//            let mergePoint = matchLen / 2
+
+            print("Match Len: \(matchLen)\n")
+            
+//            let keepFromOld = oldWords.count - overlapWordEstimate + oldIdx + mergePoint
+            let keepFromOld = oldIdx + mergePoint
+
+            let skipFromNew = newIdx + mergePoint
+            print("Old")
+            print(Array(oldWords.prefix(upTo: mergePoint+2)))
+            print("New")
+            print(Array(newWords.suffix(from: mergePoint-2)))
+            let merged = Array(oldWords.prefix(keepFromOld)) +
+                         Array(newWords.suffix(from: skipFromNew))
+            print("Merged: \(merged)\n")
+            return merged.joined(separator: " ")
+        }
+        
+        // No good overlap found - simple concat with space
+        return oldText + " " + newText
+    }
+    
+    private func normalizeWord(_ word: String) -> String {
+        return word.lowercased()
+            .trimmingCharacters(in: .punctuationCharacters)
+    }
+                                                
+    private func removingBracketedContent(_ text: String) -> String {
+        var result = text
+        
+        // Remove [...] and their contents
+        result = result.replacingOccurrences(
+            of: "\\[[^\\]]*\\]",
+            with: "",
+            options: .regularExpression
+        )
+        
+        // Remove {...} and their contents
+        result = result.replacingOccurrences(
+            of: "\\{[^\\}]*\\}",
+            with: "",
+            options: .regularExpression
+        )
+        
+        return result.trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    private func findBestMatch(_ oldWords: [String], _ newWords: [String], _ overlapWordEstimate: Int) -> (Int, Int, Int)? {
+        var bestMatch: (oldIdx: Int, newIdx: Int, length: Int)? = nil
+        var maxLen = 0
+        
+        // Define search regions
+        let oldStartIdx = max(0, oldWords.count - overlapWordEstimate)
+        let newEndIdx = min(newWords.count, overlapWordEstimate)
+        
+        // Create normalized versions for matching
+        let oldWordsNormalized = oldWords.map { normalizeWord($0) }
+        let newWordsNormalized = newWords.map { normalizeWord($0) }
+        
+        // Sliding window to find longest common substring
+        for i in oldStartIdx..<oldWords.count {
+            for j in 0..<newEndIdx {
+                var len = 0
+                while i + len < oldWords.count &&
+                      j + len < newWords.count &&
+                        oldWordsNormalized[i + len] == newWordsNormalized[j + len] {
+                    len += 1
+                }
+                if len > maxLen && len >= 3 {  // Require at least 3 word match
+                    maxLen = len
+                    bestMatch = (i, j, len)
+                }
+            }
+        }
+        
+        return bestMatch
+    }
+    
+    private func findBestMatchWConfidence(_ arr1: [String], _ arr2: [String]) -> (Int, Int, Int)? {
+        var bestMatch: (oldIdx: Int, newIdx: Int, length: Int)? = nil
+        var maxLen = 0
+        var bestConfidence = 0.0
+        
+        let minOverlapSize = min(arr1.count, arr2.count)
+        
+        for i in 0..<arr1.count {
+            for j in 0..<arr2.count {
+                var len = 0
+                while i + len < arr1.count &&
+                      j + len < arr2.count &&
+                      arr1[i + len] == arr2[j + len] {
+                    len += 1
+                }
+                
+                if len >= 3 {
+                    // Calculate confidence metrics
+                    let lengthRatio = Double(len) / Double(minOverlapSize)  // 0.0 to 1.0
+                    
+                    // Prefer matches closer to center of overlap regions
+                    let centerScore1 = 1.0 - abs(Double(i + len/2) - Double(arr1.count/2)) / Double(arr1.count)
+                    let centerScore2 = 1.0 - abs(Double(j + len/2) - Double(arr2.count/2)) / Double(arr2.count)
+                    let positionScore = (centerScore1 + centerScore2) / 2.0
+                    
+                    // Combined confidence (weighted toward length)
+                    let confidence = (lengthRatio * 0.7) + (positionScore * 0.3)
+                    
+                    // Keep best match by length, use confidence as tiebreaker
+                    if len > maxLen || (len == maxLen && confidence > bestConfidence) {
+                        maxLen = len
+                        bestConfidence = confidence
+                        bestMatch = (i, j, len)
+                    }
+                }
+            }
+        }
+        
+        return bestMatch
+    }
+
+    func detectSilence(in samples: [Float]) -> Bool {
+        guard !samples.isEmpty else { return true }
+        var rms: Float = 0
+        vDSP_rmsqv(samples, 1, &rms, vDSP_Length(samples.count))
+        return rms < silenceThreshold
+//        let frameCount = samples.count
+//        
+//        // Calculate RMS using Accelerate
+//        var rms: Float = 0
+//        vDSP_rmsqv(samples, 1, &rms, vDSP_Length(frameCount))
+//        
+//        // Update total frames first
+//        totalFramesProcessed += frameCount
+//        
+//        // Check if current buffer is silent
+//        if rms < silenceThreshold {
+//            if silenceStartFrame == nil {
+//                silenceStartFrame = totalFramesProcessed - frameCount
+//            }
+//            
+//            // Calculate silence duration
+//            let silenceFrameCount = totalFramesProcessed - silenceStartFrame!
+//            let silenceSeconds = Double(silenceFrameCount) / sampleRate
+//            
+//            return silenceSeconds >= silenceDuration
+//        } else {
+//            silenceStartFrame = nil
+//            return false
+//        }
+    }
+
+        
+//        private func transcribeAudio(_ samples: [Float]) async {
+//            guard let whisperContext = whisperContext else { return }
+//            
+//            canTranscribe = false
+//            
+//            await whisperContext.fullTranscribe(samples: samples)
+//            let text = await whisperContext.getTranscription()
+//            
+//            messageLog += "Done: \(text)\n"
+//            canTranscribe = true
+//        }
+        
+        // Implement your merge strategy here
+//        private func mergeChunks(_ chunks: [String]) -> String {
+//            guard chunks.count > 1 else {
+//                return chunks.first ?? ""
+//            }
+//            
+//            var merged = chunks[0]
+//            
+//            for i in 1..<chunks.count {
+//                merged = mergeWithConvergence(merged, chunks[i])
+//            }
+//            
+//            return merged
+//            return ""
+//        }
+        
+//        private func mergeWithConvergence(_ seg1: String, _ seg2: String) -> String {
+//            // Implement your convergence-based merge strategy here
+//            // For now, simple concatenation
+//            // TODO: Add your sliding window comparison logic
+//            
+//            let words1 = seg1.split(separator: " ").map(String.init)
+//            let words2 = seg2.split(separator: " ").map(String.init)
+//            
+//            // Simple overlap detection (you'll enhance this)
+//            let overlapSize = min(20, words1.count / 3)
+//            let seg1End = Array(words1.suffix(overlapSize))
+//            let seg2Start = Array(words2.prefix(overlapSize))
+//            
+//            // Find best match (simplified - use your algorithm)
+//            if let overlapIndex = findOverlap(seg1End, seg2Start) {
+//                let mergePoint1 = words1.count - overlapSize + overlapIndex
+//                let mergePoint2 = overlapIndex
+//                
+//                let merged = words1[0..<mergePoint1] + words2[mergePoint2...]
+//                return merged.joined(separator: " ")
+//            }
+//            
+//            // No good overlap found, just concatenate
+//            return seg1 + " " + seg2
+//            return ""
+//        }
+        
+//        private func findOverlap(_ arr1: [String], _ arr2: [String]) -> Int? {
+//            // Simplified - implement your sliding window similarity here
+//            for i in 0..<min(arr1.count, arr2.count) {
+//                if arr1[i] == arr2[i] {
+//                    return i
+//                }
+//            }
+//            return nil
+//            return 0
+//        }
     
     private func requestRecordPermission(response: @escaping (Bool) -> Void) {
 #if os(macOS)
