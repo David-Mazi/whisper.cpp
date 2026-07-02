@@ -1,0 +1,13 @@
+gcsfs==2024.6.1
+fsspec==2024.6.1
+tensorflow==2.17.1
+tensorboard==2.17.0
+fastapi==0.115.6
+starlette<0.42.0,>=0.40.0
+datasets[audio]
+transformers
+accelerate
+evaluate
+jiwer
+gradio
+tf-keras==2.17.0
